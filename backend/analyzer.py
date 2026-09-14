@@ -59,6 +59,45 @@ def _safe_mean(s):
     return float(s.mean())
 
 
+def json_safe(obj):
+    """Recursively convert a report to JSON-serializable types.
+
+    Handles datetime/Timestamp dict keys AND values, numpy scalars/arrays,
+    NaT/NaN — so any dataset (dates, ints, mixed types) serializes cleanly.
+    """
+    import datetime as _dt
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if isinstance(k, (pd.Timestamp, _dt.datetime, _dt.date)):
+                kk = k.isoformat()
+            elif isinstance(k, float) and k != k:  # NaN key
+                kk = None
+            elif isinstance(k, (str, int, float, bool)) or k is None:
+                kk = k
+            else:
+                kk = str(k)
+            out[kk] = json_safe(v)
+        return out
+    if isinstance(obj, (list, tuple)):
+        return [json_safe(x) for x in obj]
+    if isinstance(obj, (pd.Timestamp, _dt.datetime, _dt.date)):
+        return obj.isoformat()
+    if obj is None or obj is pd.NaT or obj is pd.NA:
+        return None
+    if isinstance(obj, float) and obj != obj:  # NaN
+        return None
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, np.ndarray):
+        return [json_safe(x) for x in obj.tolist()]
+    return obj
+
+
 def numeric_cols(df: pd.DataFrame):
     return [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]) and df[c].notna().sum() > 0]
 

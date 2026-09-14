@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from analyzer import analyze, investigate_finding
+from analyzer import analyze, investigate_finding, json_safe
 
 BASE = Path(__file__).resolve().parent
 FRONTEND = BASE.parent / "frontend"
@@ -165,7 +165,7 @@ async def analyze_upload(file: UploadFile = File(...)):
     report = analyze(df, dataset_name=name)
     STORE[name] = df
     REPORTS[name] = report
-    return JSONResponse(report)
+    return JSONResponse(json_safe(report))
 
 
 class SampleReq(BaseModel):
@@ -181,7 +181,7 @@ def analyze_sample(req: SampleReq):
     report = analyze(df, dataset_name=f"{req.name}.csv (sample)")
     STORE[report["dataset"]] = df
     REPORTS[report["dataset"]] = report
-    return JSONResponse(report)
+    return JSONResponse(json_safe(report))
 
 
 class InvReq(BaseModel):
@@ -201,7 +201,7 @@ def investigate(req: InvReq):
     result = investigate_finding(df, finding)
     result["finding_id"] = finding["id"]
     result["finding_title"] = finding["title"]
-    return JSONResponse(result)
+    return JSONResponse(json_safe(result))
 
 
 # ---- static frontend ----
