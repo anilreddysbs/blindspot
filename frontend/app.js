@@ -82,7 +82,9 @@ function render() {
   $("vRisk").textContent = (r.scores.hidden_risk === "HIGH" ? "🔴 " : r.scores.hidden_risk === "MEDIUM" ? "🟡 " : "🟢 ") + r.scores.hidden_risk;
   $("bRisk").style.width = r.scores.hidden_risk === "HIGH" ? "88%" : r.scores.hidden_risk === "MEDIUM" ? "55%" : "22%";
   const src = (r.findings[0] && r.findings[0].narrative_source) || "";
-  $("llmBadge").textContent = src.startsWith("LLM") ? "🤖 " + src : "🧠 " + src;
+  $("llmBadge").textContent = src.startsWith("LLM (") ? "🤖 " + src
+    : src.includes("used template reasoning") ? "🧠 template reasoning (LLM unavailable)"
+    : "🧠 " + src;
 
   if (r.spotlight) {
     $("spot").classList.remove("hidden");
@@ -155,31 +157,44 @@ async function investigate(fid) {
 
 function drawCharts(r) {
   Object.values(charts).forEach(c => c && c.destroy()); charts = {};
-  // clear stale labels from any previous report
-  $("scatterMeta").textContent = "no scatterable numeric pair in this dataset";
-  $("segMeta").textContent = "no segment split in this dataset";
-  $("histMeta").textContent = "—";
   Chart.defaults.color = "#8ea0c9"; Chart.defaults.borderColor = "rgba(140,160,200,.12)";
-  const ch = r.charts || {};
-  if (ch.scatter) {
-    $("scatterMeta").textContent = `${ch.scatter.x} vs ${ch.scatter.y} · red = ML-flagged outliers`;
-    charts.s = new Chart($("chScatter"), { type: "scatter",
-      data: { datasets: [
-        { label: "normal", data: ch.scatter.normal.x.map((x, i) => ({ x, y: ch.scatter.normal.y[i] })), backgroundColor: "rgba(56,189,248,.45)", pointRadius: 3 },
-        { label: "anomaly", data: ch.scatter.anomalous.x.map((x, i) => ({ x, y: ch.scatter.anomalous.y[i] })), backgroundColor: "#fb7185", pointRadius: 4 }]},
-      options: { plugins: { legend: { labels: { boxWidth: 12 } } }, scales: { x: { title: { display: true, text: ch.scatter.x } }, y: { title: { display: true, text: ch.scatter.y } } } } });
+  const box = $("plots");
+  box.innerHTML = "";
+  const plots = (r.charts && r.charts.plots) || [];
+  if (!plots.length) {
+    box.innerHTML = `<div class="card p-5 text-sm text-slate-400">No chart-worthy pattern — nothing here needed a picture. The findings above say it all.</div>`;
+    return;
   }
-  if (ch.segment_bars) {
-    $("segMeta").textContent = `${ch.segment_bars.num} by ${ch.segment_bars.cat} · dashed = overall avg`;
-    charts.b = new Chart($("chSeg"), { type: "bar",
-      data: { labels: ch.segment_bars.labels, datasets: [{ data: ch.segment_bars.values, backgroundColor: ["#7c6cff", "#38bdf8", "#34d399", "#fbbf24", "#fb7185"], borderRadius: 8 }]},
-      options: { plugins: { legend: { display: false } } } });
-  }
-  if (ch.histogram) {
-    $("histMeta").textContent = `distribution of ${ch.histogram.column}`;
-    const mid = ch.histogram.bins.slice(1).map((b, i) => ((b + ch.histogram.bins[i]) / 2).toFixed(0));
-    charts.h = new Chart($("chHist"), { type: "bar",
-      data: { labels: mid, datasets: [{ data: ch.histogram.counts, backgroundColor: "rgba(124,108,255,.6)", borderRadius: 4 }]},
-      options: { plugins: { legend: { display: false } } } });
-  }
+  const PALETTE = ["#7c6cff", "#38bdf8", "#34d399", "#fbbf24", "#fb7185", "#f472b6", "#a3e635"];
+  plots.forEach((p, i) => {
+    const card = document.createElement("div");
+    card.className = "card p-5";
+    card.innerHTML = `<div class="flex items-center gap-2"><div class="text-sm font-semibold text-white">${esc(p.title)}</div>` +
+      (p.finding_id ? `<button class="ml-auto text-[11px] ghost rounded-lg px-2 py-0.5 shrink-0" data-f="${p.finding_id}">view ${p.finding_id} →</button>` : "") +
+      `</div><div class="text-[11px] text-slate-500 mt-0.5">${esc(p.subtitle || "")}</div>` +
+      `<div class="mt-2"><canvas id="plot_${p.id}"></canvas></div>`;
+    box.appendChild(card);
+    const btn = card.querySelector("[data-f]");
+    if (btn) btn.onclick = () => investigate(btn.dataset.f);
+    const ctx = card.querySelector("canvas");
+    const common = { plugins: { legend: { labels: { boxWidth: 12 } } } };
+    let cfg = null;
+    if (p.kind === "scatter") {
+      cfg = { type: "scatter", data: { datasets: p.datasets.map(d => ({ label: d.label, data: d.points.map(pt => ({ x: pt[0], y: pt[1] })), backgroundColor: d.color, pointRadius: 3.5 })) },
+        options: { ...common, scales: { x: { title: { display: true, text: p.x_label } }, y: { title: { display: true, text: p.y_label } } } } };
+    } else if (p.kind === "bar") {
+      const showOverall = p.overall !== null && p.overall !== undefined;
+      const colors = (p.labels || []).map(l => (p.highlight && String(l) === String(p.highlight)) ? "#fb7185" : "#7c6cff");
+      const datasets = [{ data: p.values, backgroundColor: colors, borderRadius: 8 }];
+      if (showOverall) datasets.push({ type: "line", label: "overall avg", data: p.labels.map(() => p.overall), borderColor: "#e2e8f0", borderDash: [6, 4], pointRadius: 0, borderWidth: 1.5 });
+      cfg = { type: "bar", data: { labels: p.labels, datasets }, options: { ...common, plugins: { legend: { display: showOverall } } } };
+    } else if (p.kind === "grouped") {
+      cfg = { type: "bar", data: { labels: p.labels, datasets: p.datasets.map((d, j) => ({ label: d.label, data: d.values, backgroundColor: PALETTE[(j + i) % PALETTE.length], borderRadius: 6 })) }, options: common };
+    } else if (p.kind === "hist") {
+      cfg = { type: "bar", data: { labels: p.labels, datasets: [{ data: p.values, backgroundColor: "rgba(124,108,255,.6)", borderRadius: 4 }] }, options: { ...common, plugins: { legend: { display: false } } } };
+    } else if (p.kind === "line") {
+      cfg = { type: "line", data: { labels: p.labels, datasets: [{ data: p.values, borderColor: "#38bdf8", backgroundColor: "rgba(56,189,248,.15)", fill: true, tension: 0.3, pointRadius: 3 }] }, options: { ...common, plugins: { legend: { display: false } } } };
+    }
+    if (cfg) charts[p.id] = new Chart(ctx, cfg);
+  });
 }

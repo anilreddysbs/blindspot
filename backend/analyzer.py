@@ -588,17 +588,25 @@ def detect_relationships(df: pd.DataFrame, num_cols: list[str]) -> list[dict]:
                 rate = float(ok[valid].mean())
                 if rate >= 0.90:
                     viol = df.index[valid & ~ok].tolist()
-                    ev = []
+                    ev, pairs = [], []
                     for i in viol[:5]:
                         try:
                             pv = float(pred.loc[i])
                         except Exception:
                             pv = float("nan")
+                        try:
+                            av = float(C.loc[i])
+                        except Exception:
+                            av = float("nan")
                         ev.append(f"{_label_for(df, i)}: {c}={C.loc[i]:g} but {a}{sym}{b}={pv:,.2f}")
+                        if np.isfinite(av) and np.isfinite(pv):
+                            pairs.append({"label": _label_for(df, i)[:18],
+                                          "actual": round(av, 2), "expected": round(pv, 2)})
                     out.append({"type": "formula", "rule": f"{c} ≈ {a} {sym} {b}",
                                 "hold_rate": round(rate * 100, 1),
                                 "violations": [int(i) for i in viol],
-                                "evidence": ev, "columns": [a, b, c]})
+                                "evidence": ev, "columns": [a, b, c],
+                                "pairs": pairs[:8]})
             except Exception:
                 continue
     out.sort(key=lambda r: (-len(r["violations"]), -r["hold_rate"]))
@@ -868,6 +876,9 @@ def analyze(df: pd.DataFrame, dataset_name: str = "uploaded dataset") -> dict:
             "confidence": confidence_for(10, s["spread_pct"]),
             "possible_factor": None, "columns": [s["cat"], s["num"]],
             "cat": s["cat"], "worst": worst,
+            "detail": {"labels": list(s["means"].keys()),
+                       "values": [round(float(v), 2) for v in s["means"].values()],
+                       "overall": ov, "worst": str(worst)},
             "indices": [int(i) for i in df.index[df[s["cat"]].astype(str) == str(worst)][:60].tolist()],
             "narrative_source": llm_source,
             "causation_note": "⚠️ Indicates correlation, not causation.",
@@ -947,6 +958,10 @@ def analyze(df: pd.DataFrame, dataset_name: str = "uploaded dataset") -> dict:
                     "evidence": [f"{k}: {v} (overall {round(means_all[k],1)})" for k, v in list(e["means"].items())[:5]],
                     "count": e["count"], "pct": e["pct"], "confidence": 74,
                     "possible_factor": None, "columns": num_cols[:3], "indices": [],
+                    "detail": {"labels": list(e["means"].keys())[:5],
+                               "cluster_values": [e["means"][k] for k in list(e["means"].keys())[:5]],
+                               "overall_values": [round(means_all[k], 1) for k in list(e["means"].keys())[:5]],
+                               "name": f"Cluster {e['cluster']}"},
                     "narrative_source": "clustering (k-means)",
                     "causation_note": "⚠️ Descriptive grouping — validate before acting.",
                 })
@@ -1033,7 +1048,8 @@ def analyze(df: pd.DataFrame, dataset_name: str = "uploaded dataset") -> dict:
     summary = build_executive_summary(dataset_name, n, findings, data_health, avg_conf, risk)
 
     # chart payloads (generic, frontend picks labels)
-    charts = build_charts(df, num_cols, cat_cols, anomalies, contradictions, segments, clusters)
+    charts = build_charts(df, num_cols, cat_cols, anomalies, contradictions, segments,
+                        clusters, findings, relationships, missing)
 
     return {
         "dataset": dataset_name,
@@ -1129,57 +1145,143 @@ def build_markdown(rep: dict) -> str:
     return "\n".join(L)
 
 
-def build_charts(df, num_cols, cat_cols, anomalies, contradictions, segments, clusters) -> dict:
-    charts: dict = {}
-    # scatter: first contradiction pair, else first two numerics
-    sx, sy = None, None
-    if contradictions:
-        sx, sy = contradictions[0]["col_a"], contradictions[0]["col_b"]
-    elif len(num_cols) >= 2:
-        sx, sy = num_cols[0], num_cols[1]
-    if sx and sy:
-        flags = anomalies["flags"]
-        pts_normal = {"x": [], "y": []}
-        pts_anom = {"x": [], "y": []}
-        for i in range(min(len(df), 600)):
-            try:
-                x = float(df.iloc[i][sx]); y = float(df.iloc[i][sy])
-            except Exception:
-                continue
-            if pd.isna(x) or pd.isna(y):
-                continue
-            (pts_anom if flags[i] else pts_normal)["x"].append(x)
-            (pts_anom if flags[i] else pts_normal)["y"].append(y)
-        charts["scatter"] = {"x": sx, "y": sy, "normal": pts_normal, "anomalous": pts_anom}
-    # histogram of outcome-ish column (last numeric or sy)
-    target = sy or (num_cols[-1] if num_cols else None)
-    if target:
-        s = pd.to_numeric(df[target], errors="coerce").dropna()
-        if len(s):
-            hist, edges = np.histogram(s.values, bins=min(20, max(8, len(s) // 10)))
-            charts["histogram"] = {"column": target, "bins": [round(float(e), 1) for e in edges.tolist()],
-                                   "counts": [int(c) for c in hist.tolist()]}
-    # segment bars
-    if segments:
-        s0 = segments[0]
-        charts["segment_bars"] = {"cat": s0["cat"], "num": s0["num"],
-                                  "labels": list(s0["means"].keys()),
-                                  "values": list(s0["means"].values()),
-                                  "overall": s0["overall"]}
-    elif cat_cols and num_cols:
-        cat, num = cat_cols[0], num_cols[0]
-        means = pd.to_numeric(df[num], errors="coerce").groupby(df[cat].astype(str)).mean().head(8)
-        charts["segment_bars"] = {"cat": cat, "num": num, "labels": list(means.index),
-                                  "values": [round(float(v), 2) for v in means.values],
-                                  "overall": round(float(pd.to_numeric(df[num], errors='coerce').mean()), 2)}
-    # trend: if a date-like col exists, mean of target over it
-    date_col = next((c for c in df.columns if any(k in c.lower() for k in ("date", "month", "week"))), None)
-    if date_col and target:
+def _scatter_points(df, x, y, hi_idx, cap=600):
+    hi = set(hi_idx or [])
+    pos = df.index.tolist()
+    norm, hi_pts = [], []
+    for k, i in enumerate(pos[:cap]):
         try:
-            g = pd.to_numeric(df[target], errors="coerce").groupby(df[date_col].astype(str)).mean()
-            charts["trend"] = {"by": date_col, "metric": target,
-                               "labels": list(g.index.astype(str))[:24],
-                               "values": [round(float(v), 2) for v in g.values[:24]]}
+            xv = float(df.at[i, x])
+            yv = float(df.at[i, y])
+        except Exception:
+            continue
+        if pd.isna(xv) or pd.isna(yv):
+            continue
+        (hi_pts if i in hi else norm).append([xv, yv])
+    return norm, hi_pts
+
+
+def build_charts(df, num_cols, cat_cols, anomalies, contradictions, segments, clusters,
+                 findings, relationships, missing) -> dict:
+    """Chart planner: every plot is chosen because a finding earned it.
+
+    contradiction -> scatter with the subgroup highlighted | segment -> category
+    bars + overall line | broken formula -> expected-vs-recorded bars |
+    outliers -> anomaly scatter | cluster -> group-vs-overall bars |
+    missing -> gaps chart | most-cited metric -> distribution | dates -> trend.
+    No data for a plot type = no plot, never a placeholder.
+    """
+    plots: list[dict] = []
+
+    def scatter_plot(pid, title, subtitle, fid, x, y, hi_idx):
+        norm, hi_pts = _scatter_points(df, x, y, hi_idx)
+        if not norm and not hi_pts:
+            return None
+        return {"id": pid, "kind": "scatter", "title": title, "subtitle": subtitle,
+                "finding_id": fid, "x_label": x, "y_label": y,
+                "datasets": [
+                    {"label": "rest of data", "color": "rgba(56,189,248,.45)", "points": norm},
+                    {"label": "flagged group", "color": "#fb7185", "points": hi_pts}]}
+
+    # 1. contradiction scatter (the wow chart)
+    for f in findings:
+        if f.get("kind") == "contradiction" and len(f.get("columns", [])) >= 2:
+            a, b = f["columns"][0], f["columns"][1]
+            p = scatter_plot("p_contra", f"{a} vs {b}: the {f['count']} records that break the pattern",
+                             f"{f['id']}: positively correlated overall (r shown in finding), yet this group diverges.",
+                             f["id"], a, b, f.get("indices"))
+            if p:
+                plots.append(p)
+            break
+
+    # 2. segment bars for the top segment finding
+    for f in findings:
+        d = f.get("detail") or {}
+        if f.get("kind") == "segment" and d.get("labels"):
+            plots.append({"id": "p_seg", "kind": "bar",
+                          "title": f"{f['columns'][1]} by {f['columns'][0]}",
+                          "subtitle": f"{f['id']}: '{d.get('worst')}' (rose) lags the overall average (dashed).",
+                          "finding_id": f["id"], "labels": d["labels"], "values": d["values"],
+                          "overall": d["overall"], "highlight": d.get("worst")})
+            break
+
+    # 3. expected-vs-recorded for the top broken formula
+    for rel in relationships:
+        if rel.get("violations") and rel.get("pairs"):
+            plots.append({"id": "p_formula", "kind": "grouped",
+                          "title": f"Expected vs recorded: {rel['rule']}",
+                          "subtitle": f"Formula audit: {len(rel['violations'])} row(s) break a rule holding "
+                                      f"{rel['hold_rate']}% elsewhere. Teal = formula says, rose = actually recorded.",
+                          "finding_id": next((f["id"] for f in findings if f.get("kind") == "formula"), None),
+                          "labels": [p["label"] for p in rel["pairs"]],
+                          "datasets": [{"label": "formula expects", "values": [p["expected"] for p in rel["pairs"]]},
+                                       {"label": "actually recorded", "values": [p["actual"] for p in rel["pairs"]]}]})
+            break
+
+    # 4. anomaly scatter, but only if nothing scatter-like exists yet
+    if (not any(p["kind"] == "scatter" for p in plots)
+            and anomalies["anomaly_count"] >= 3 and len(num_cols) >= 2):
+        of = next((f["id"] for f in findings if f.get("kind") == "outliers"), None)
+        p = scatter_plot("p_out", f"{num_cols[0]} vs {num_cols[1]}: ML-flagged outliers",
+                         "IsolationForest + z-score ensemble. Red = statistically unusual records.",
+                         of, num_cols[0], num_cols[1],
+                         [r["index"] for r in anomalies["top"]])
+        if p:
+            plots.append(p)
+
+    # 5. cluster profile bars
+    for f in findings:
+        d = f.get("detail") or {}
+        if f.get("kind") == "cluster" and d.get("labels"):
+            plots.append({"id": "p_clu", "kind": "grouped",
+                          "title": f"{d.get('name', 'Subgroup')} vs overall average",
+                          "subtitle": f"{f['id']}: this subgroup differs on several metrics at once.",
+                          "finding_id": f["id"], "labels": d["labels"],
+                          "datasets": [{"label": d.get("name", "subgroup"), "values": d["cluster_values"]},
+                                       {"label": "overall", "values": d["overall_values"]}]})
+            break
+
+    # 6. missing-data gaps chart (only when gaps exist)
+    if missing:
+        plots.append({"id": "p_miss", "kind": "bar",
+                      "title": "Where the data gaps are",
+                      "subtitle": "Columns with 5%+ missing. Averages silently drop these rows.",
+                      "finding_id": next((f["id"] for f in findings if f.get("kind") == "missing"), None),
+                      "labels": [m["column"] for m in missing],
+                      "values": [m["pct"] for m in missing], "overall": None, "highlight": None})
+
+    # 7. distribution of the most-cited numeric metric
+    if num_cols and len(df) >= 10:
+        from collections import Counter
+        cited = Counter(c for f in findings for c in f.get("columns", []) if c in num_cols)
+        target = cited.most_common(1)[0][0] if cited else num_cols[-1]
+        s = pd.to_numeric(df[target], errors="coerce").dropna()
+        if len(s) >= 10:
+            hist, edges = np.histogram(s.values, bins=min(20, max(8, len(s) // 10)))
+            plots.append({"id": "p_hist", "kind": "hist",
+                          "title": f"Distribution of {target}",
+                          "subtitle": "Shape check: skew, cliffs, or twin peaks often explain the findings above.",
+                          "finding_id": None,
+                          "labels": [str(round((edges[i] + edges[i + 1]) / 2, 1)) for i in range(len(hist))],
+                          "values": [int(c) for c in hist.tolist()]})
+
+    # 8. trend, only when a date-like column exists
+    date_col = next((c for c in df.columns if any(k in str(c).lower() for k in ("date", "month", "week"))), None)
+    numeric_targets = [c for c in num_cols]
+    if date_col and numeric_targets:
+        from collections import Counter as _C
+        cited = _C(c for f in findings for c in f.get("columns", []) if c in num_cols)
+        metric = cited.most_common(1)[0][0] if cited else numeric_targets[0]
+        try:
+            g = pd.to_numeric(df[metric], errors="coerce").groupby(df[date_col].astype(str)).mean()
+            if len(g) >= 3:
+                plots.append({"id": "p_trend", "kind": "line",
+                              "title": f"{metric} over {date_col}",
+                              "subtitle": "Time path of the metric behind the findings.",
+                              "finding_id": None,
+                              "labels": list(g.index.astype(str))[:24],
+                              "values": [round(float(v), 2) for v in g.values[:24]]})
         except Exception:
             pass
-    return charts
+
+    return {"plots": plots[:6]}
