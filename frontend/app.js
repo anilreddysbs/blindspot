@@ -90,6 +90,23 @@ function render() {
     $("spotBtn").onclick = () => investigate(r.spotlight.finding_id);
   } else $("spot").classList.add("hidden");
 
+  if (r.summary && r.summary.bullets) {
+    $("sumCard").classList.remove("hidden");
+    $("sumSrc").textContent = "· " + (r.summary.source || "");
+    $("sumBullets").innerHTML = r.summary.bullets.map(b => `<li>${esc(b)}</li>`).join("");
+  } else $("sumCard").classList.add("hidden");
+
+  $("surgery").textContent = (r.surgery && r.surgery.length) ? ("🔧 " + r.surgery.join(" · ")) : "";
+  $("dlBtn").onclick = async () => {
+    const res = await fetch("/api/report-md", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ dataset: REPORT.dataset }) });
+    const d = await res.json();
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([d.markdown], { type: "text/markdown" }));
+    a.download = d.filename || "blindspot-report.md";
+    a.click();
+    URL.revokeObjectURL(a.href);
+  };
+
   $("fCount").textContent = `(${r.findings.length})`;
   $("findings").innerHTML = r.findings.map((f, i) => `
     <div class="card sev-${f.severity} p-5">

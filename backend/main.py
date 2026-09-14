@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from analyzer import analyze, investigate_finding, json_safe
+from analyzer import analyze, investigate_finding, json_safe, build_markdown, _needs_header_search
 
 BASE = Path(__file__).resolve().parent
 FRONTEND = BASE.parent / "frontend"
@@ -113,9 +113,15 @@ def _load_table_bytes(raw: bytes, filename: str) -> pd.DataFrame:
             raise ValueError("could not parse delimited text")
         if ext in (".xlsx", ".xls"):
             try:
-                return pd.read_excel(bio, engine="openpyxl" if ext == ".xlsx" else None)
+                eng = "openpyxl" if ext == ".xlsx" else "xlrd"
+                first = pd.read_excel(bio, engine=eng)
+                # title rows above the true header? re-read raw and let ingest find it
+                if _needs_header_search(first) and len(first) > 3:
+                    bio.seek(0)
+                    return pd.read_excel(bio, engine=eng, header=None)
+                return first
             except ImportError:
-                raise ValueError("Excel support needs 'openpyxl' (pip install openpyxl)")
+                raise ValueError("Excel support needs 'openpyxl' (+ 'xlrd' for .xls)")
         if ext == ".json":
             import json as _json
             text = raw.decode("utf-8-sig", errors="replace")
@@ -202,6 +208,21 @@ def investigate(req: InvReq):
     result["finding_id"] = finding["id"]
     result["finding_title"] = finding["title"]
     return JSONResponse(json_safe(result))
+
+
+class DsReq(BaseModel):
+    dataset: str
+
+
+@app.post("/api/report-md")
+def report_md(req: DsReq):
+    rep = REPORTS.get(req.dataset)
+    if rep is None:
+        raise HTTPException(404, "Dataset expired — re-upload the file")
+    return JSONResponse(json_safe({
+        "filename": f"blindspot-{(req.dataset or 'report').split('.')[0]}.md",
+        "markdown": build_markdown(rep),
+    }))
 
 
 # ---- static frontend ----

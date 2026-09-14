@@ -7,6 +7,11 @@ anomalies, contradictions, missing data, hidden segment effects and entry errors
 then explains each finding **with evidence and confidence**, and lets you
 **Investigate** any finding across every other variable.
 
+It also eats **messy real-world files**: title rows above the header, numbers
+stored as `"$1,200"` text, percentages — all auto-repaired with a visible
+surgery log. And it **audits spreadsheet formulas**: if `Total ≈ Units × Price`
+holds for 95% of rows but breaks in 3, those rows are flagged as critical.
+
 ## The wow-moment demo (60 seconds)
 
 ```powershell
@@ -73,6 +78,7 @@ blindspot/
 | `POST /api/analyze` | multipart `file` (CSV, TSV, Excel `.xlsx/.xls`, JSON records, Parquet) → full report |
 | `POST /api/analyze-sample` | `{"name":"students"\|"sales"}` → full report |
 | `POST /api/investigate` | `{"dataset":…, "finding_id":"F1"}` → drill-down |
+| `POST /api/report-md` | `{"dataset":…}` → board-ready markdown report (download button in UI) |
 | `GET /api/samples`, `GET /api/health` | metadata |
 
 ## Scores

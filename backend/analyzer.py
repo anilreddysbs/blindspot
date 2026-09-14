@@ -112,6 +112,147 @@ def categorical_cols(df: pd.DataFrame):
     return out
 
 
+# ---------------------------------------------------------------- Smart ingest
+# Real-world files are messy: title rows above the header, numbers stored as
+# "$1,200" text, percentages, empty padding rows. ingest_table() repairs all
+# of that and logs every repair in `surgery` so the user sees what changed.
+
+def _looks_numeric_text(v) -> bool:
+    if not isinstance(v, str):
+        return isinstance(v, (int, float)) and not pd.isna(v)
+    t = v.strip().replace(",", "").replace("$", "").replace("€", "").replace("₹", "")
+    t = t.strip("()% ")
+    if t.endswith("%"):
+        t = t[:-1]
+    if t.lower() in ("", "-", "na", "n/a", "null", "none"):
+        return False
+    try:
+        float(t)
+        return True
+    except Exception:
+        return False
+
+
+def _needs_header_search(df: pd.DataFrame) -> bool:
+    cols = [str(c) for c in df.columns]
+    if isinstance(df.columns, pd.RangeIndex):
+        return True
+    if cols and all(c.isdigit() for c in cols):
+        return True  # header=None read that hasn't been assigned yet
+    unnamed = sum(c.startswith("Unnamed") for c in cols)
+    blank = sum(c.strip() in ("", "nan", "None") for c in cols)
+    return (unnamed + blank) / max(len(cols), 1) >= 0.4
+
+
+def _find_header_row(df: pd.DataFrame) -> int | None:
+    """Score the first rows; the most header-like row wins. None = keep as-is."""
+    ncols = len(df.columns)
+    best, best_score = None, 0.0
+    for r in range(min(12, len(df))):
+        row = df.iloc[r].tolist()
+        strings = sum(1 for v in row if isinstance(v, str) and v.strip() and not _looks_numeric_text(v))
+        nonnull = sum(1 for v in row if not (pd.isna(v) or (isinstance(v, str) and not v.strip())))
+        numeric = sum(1 for v in row if _looks_numeric_text(v) and not isinstance(v, str))
+        score = strings * 2 + nonnull * 0.5 - numeric * 1.5
+        if strings >= 2 and nonnull >= max(2, ncols * 0.5) and score > best_score:
+            best, best_score = r, score
+    return best
+
+
+def _coerce_numeric_column(s: pd.Series) -> pd.Series | None:
+    """Parse '$1,200', '72,000', '85%', '(12)' text into numbers. None if not numeric-ish."""
+    if pd.api.types.is_numeric_dtype(s):
+        return None  # already numeric
+    raw = s.copy()
+    str_s = s.astype(str).str.strip()
+    is_empty = str_s.isin(["", "nan", "None", "NA", "N/A", "n/a", "-", "null", "NULL", "NoneType"]) | s.isna()
+    neg = str_s.str.match(r"^\(.*\)$", na=False)
+    t = (str_s.str.replace(r"[$€₹,\\\s]", "", regex=True)
+              .str.replace(r"[()]", "", regex=True))
+    t = t.str.rstrip("%")
+    v = pd.to_numeric(t, errors="coerce")
+    v = v.mask(neg & v.notna(), -v)
+    v = v.mask(is_empty, np.nan)
+    hit = int(v.notna().sum())
+    if hit >= 5 and hit / max(len(s), 1) >= 0.6:
+        return v
+    return None
+
+
+def ingest_table(df_raw: pd.DataFrame, filename: str = "") -> tuple[pd.DataFrame, list[str]]:
+    """Repair a freshly-parsed table. Returns (clean_df, surgery_notes)."""
+    surgery: list[str] = []
+    df = df_raw.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # 1. header search (title rows above the real header)
+    if _needs_header_search(df) and len(df) > 3:
+        hr = _find_header_row(df)
+        if hr is not None:
+            new_cols = []
+            for i, v in enumerate(df.iloc[hr].tolist()):
+                name = str(v).strip() if not pd.isna(v) else ""
+                new_cols.append(name if name and name.lower() != "nan" else f"Column_{i + 1}")
+            # de-dupe
+            seen: dict[str, int] = {}
+            for i, name in enumerate(new_cols):
+                if name in seen:
+                    seen[name] += 1
+                    new_cols[i] = f"{name}_{seen[name]}"
+                else:
+                    seen[name] = 0
+            df.columns = new_cols
+            df = df.iloc[hr + 1:].reset_index(drop=True)
+            if hr > 0:
+                skipped = hr
+                surgery.append(f"Header detected at row {hr + 1}: skipped {skipped} title row(s) above it")
+
+    # 2. strip whitespace in text cells; normalize empties
+    for c in df.columns:
+        if df[c].dtype == object:
+            df[c] = df[c].apply(lambda v: v.strip() if isinstance(v, str) else v)
+            df[c] = df[c].replace(["", "-", "NA", "N/A", "n/a", "null", "NULL"], np.nan)
+
+    # 3. drop fully-empty rows/cols (padding)
+    before_cols = len(df.columns)
+    df = df.dropna(axis=1, how="all").dropna(axis=0, how="all").reset_index(drop=True)
+    if before_cols - len(df.columns) > 0:
+        surgery.append(f"Removed {before_cols - len(df.columns)} fully-empty column(s)")
+
+    # 4. coerce numeric-looking text ("$1,200", "72,000", "85%")
+    coerced = []
+    for c in list(df.columns):
+        v = _coerce_numeric_column(df[c])
+        if v is not None:
+            df[c] = v
+            coerced.append(c)
+    if coerced:
+        surgery.append(f"Converted text to numbers (currency/commas/% stripped): {', '.join(coerced)}")
+
+    # 5. try datetime parse on remaining text cols that look like dates
+    import re as _re
+    _date_pat = _re.compile(r"\d{1,4}[-/]\d{1,2}(?:[-/]\d{1,4})?|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec", _re.I)
+    for c in list(df.columns):
+        if df[c].dtype == object and df[c].notna().sum() >= 5:
+            sample = df[c].dropna().head(20).astype(str)
+            if (sample.str.contains(_date_pat, na=False).mean() < 0.5):
+                continue
+            try:
+                import warnings as _w
+                with _w.catch_warnings():
+                    _w.simplefilter("ignore")
+                    parsed = pd.to_datetime(sample, errors="coerce", dayfirst=False)
+                if parsed.notna().mean() >= 0.8:
+                    with _w.catch_warnings():
+                        _w.simplefilter("ignore")
+                        df[c] = pd.to_datetime(df[c], errors="coerce", dayfirst=False)
+                    surgery.append(f"Parsed '{c}' as dates")
+            except Exception:
+                pass
+
+    return df, surgery
+
+
 def guess_role(col: str) -> str:
     c = col.lower()
     if any(k in c for k in ("final", "result", "score_final", "exam_final")):
@@ -399,6 +540,109 @@ def detect_clusters(df: pd.DataFrame, num_cols: list[str]):
         return None
 
 
+# ------------------------------------------------- Layer 3b: formula audit
+# Spreadsheet-style rules (C ≈ A+B, A−B, A×B, A÷B). A rule holding for ≥90%
+# of rows but broken in a few is a smoking gun: an overwritten formula or a
+# typed-in wrong number. Fully-holding rules become trust signals.
+
+def _label_for(df: pd.DataFrame, i) -> str:
+    """Human label for a row: first short text column's value, else #index."""
+    for c in df.columns:
+        if df[c].dtype == object:
+            try:
+                v = df.at[i, c]
+            except Exception:
+                v = None
+            if isinstance(v, str) and v.strip() and len(v.strip()) <= 24:
+                return f"{c}={v.strip()}"
+    return f"row {i}"
+
+
+def detect_relationships(df: pd.DataFrame, num_cols: list[str]) -> list[dict]:
+    import itertools
+    import operator
+    out = []
+    cols = num_cols[:8]
+    if len(cols) < 3 or len(df) < 8:
+        return out
+    series = {c: pd.to_numeric(df[c], errors="coerce") for c in cols}
+    ops = [("+", operator.add), ("−", operator.sub), ("×", operator.mul), ("÷", operator.truediv)]
+    for a, b, c in itertools.permutations(cols, 3):
+        A, B, C = series[a], series[b], series[c]
+        cstd = C.std(skipna=True)
+        if not np.isfinite(cstd) or cstd == 0:
+            continue
+        for sym, fn in ops:
+            try:
+                with np.errstate(all="ignore"):
+                    pred = fn(A, B) if sym != "÷" else A / B.where(B.abs() > 1e-9)
+                    pred = pred.replace([np.inf, -np.inf], np.nan)
+                pstd = pred.std(skipna=True)
+                if not np.isfinite(pstd) or pstd == 0:
+                    continue
+                valid = C.notna() & pred.notna()
+                if int(valid.sum()) < 8:
+                    continue
+                denom = C.abs().where(C.abs() > 1.0, 1.0)
+                ok = ((C - pred).abs() / denom <= 0.02) | ((C - pred).abs() <= 0.05)
+                rate = float(ok[valid].mean())
+                if rate >= 0.90:
+                    viol = df.index[valid & ~ok].tolist()
+                    ev = []
+                    for i in viol[:5]:
+                        try:
+                            pv = float(pred.loc[i])
+                        except Exception:
+                            pv = float("nan")
+                        ev.append(f"{_label_for(df, i)}: {c}={C.loc[i]:g} but {a}{sym}{b}={pv:,.2f}")
+                    out.append({"type": "formula", "rule": f"{c} ≈ {a} {sym} {b}",
+                                "hold_rate": round(rate * 100, 1),
+                                "violations": [int(i) for i in viol],
+                                "evidence": ev, "columns": [a, b, c]})
+            except Exception:
+                continue
+    out.sort(key=lambda r: (-len(r["violations"]), -r["hold_rate"]))
+    seen, uniq = set(), []
+    for r in out:
+        if r["rule"] in seen:
+            continue
+        seen.add(r["rule"])
+        uniq.append(r)
+    # drop near-duplicate rules flagging the same rows (e.g. C≈A×B vs C≈B×A)
+    kept = []
+    for r in uniq:
+        vs = set(r["violations"])
+        if vs and any(len(vs & set(k["violations"])) / max(len(vs | set(k["violations"])), 1) > 0.5 for k in kept):
+            continue
+        kept.append(r)
+    broken = [r for r in kept if r["violations"]]
+    verified = [r for r in kept if not r["violations"]]
+    return broken[:3] + verified[:1]
+
+
+def detect_duplicate_keys(df: pd.DataFrame) -> list[dict]:
+    out = []
+    for c in df.columns:
+        cl = str(c).lower()
+        hinted = any(k in cl for k in ("id", "code", "sku", "key", "no.", "number", "ref"))
+        s = df[c].dropna()
+        if len(s) < 5:
+            continue
+        dups = s[s.duplicated(keep=False)]
+        if len(dups) == 0:
+            continue
+        uniq_ratio = s.nunique() / max(len(s), 1)
+        # a real key column is near-unique; count/measure columns repeat naturally
+        if uniq_ratio < 0.7:
+            continue
+        if hinted or (uniq_ratio > 0.95 and len(dups) <= 5):
+            vals = dups.value_counts().head(5)
+            out.append({"column": c, "count": int(len(dups)),
+                        "pct": round(len(dups) / len(df) * 100, 1),
+                        "examples": [f"{v} ×{k}" for v, k in zip(vals.index.astype(str), vals.values)]})
+    return out[:3]
+
+
 # ---------------------------------------------------------------- Layer 4: narrative reasoning
 
 LLM_TEMPLATE_NOTE = ("Template reasoning (no LLM key configured). "
@@ -546,11 +790,7 @@ def investigate_finding(df: pd.DataFrame, finding: dict) -> dict:
 # ---------------------------------------------------------------- orchestration
 
 def analyze(df: pd.DataFrame, dataset_name: str = "uploaded dataset") -> dict:
-    df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-    # drop fully-empty cols/rows
-    df = df.dropna(axis=1, how="all")
-    df = df.dropna(axis=0, how="all")
+    df, surgery = ingest_table(df, dataset_name)
     n = len(df)
     num_cols = numeric_cols(df)
     cat_cols = categorical_cols(df)
@@ -561,6 +801,8 @@ def analyze(df: pd.DataFrame, dataset_name: str = "uploaded dataset") -> dict:
     missing = detect_missing(df)
     quality = detect_quality(df, num_cols)
     clusters = detect_clusters(df, num_cols)
+    relationships = detect_relationships(df, num_cols)
+    duplicates = detect_duplicate_keys(df)
 
     findings: list[dict] = []
     fid = 1
@@ -710,6 +952,56 @@ def analyze(df: pd.DataFrame, dataset_name: str = "uploaded dataset") -> dict:
                 })
                 fid += 1
 
+    # formula audit findings (broken calculations = critical)
+    for rel in relationships:
+        if rel["violations"]:
+            k = len(rel["violations"])
+            title = f"Broken calculation: {rel['rule']} fails in {k} row(s)"
+            desc = (f"The rule '{rel['rule']}' holds for {rel['hold_rate']}% of rows, "
+                    f"so it looks like a real spreadsheet formula — but {k} row(s) break it. "
+                    f"Someone likely overwrote a formula with a typed value, or a number was mis-entered.")
+            prompt = (f"Dataset {dataset_name} ({n} rows). Audit: rule {rel['rule']} holds {rel['hold_rate']}% "
+                      f"but fails here: {'; '.join(rel['evidence'][:3])}. Explain in <=3 sentences and say how to verify.")
+            llm_text, llm_source = llm_narrative(prompt)
+            findings.append({
+                "id": f"F{fid}", "severity": "critical", "kind": "formula",
+                "title": title, "description": llm_text or desc,
+                "evidence": rel["evidence"] + [f"rule holds in {rel['hold_rate']}% of rows"],
+                "count": k, "pct": round(k / max(n, 1) * 100, 1),
+                "confidence": min(93, 75 + rel["hold_rate"] // 5),
+                "possible_factor": None, "columns": rel["columns"],
+                "indices": rel["violations"][:60],
+                "narrative_source": llm_source,
+                "causation_note": "Deterministic arithmetic check — verify the source formula.",
+            })
+            fid += 1
+        else:
+            findings.append({
+                "id": f"F{fid}", "severity": "info", "kind": "verified",
+                "title": f"Verified calculation: {rel['rule']} holds everywhere ✅",
+                "description": (f"Checked all {n} rows: '{rel['rule']}' holds within 2% tolerance. "
+                                f"This part of your data is internally consistent — you can trust it."),
+                "evidence": [f"{rel['rule']} holds in 100% of {n} rows"],
+                "count": n, "pct": 100.0, "confidence": 99,
+                "possible_factor": None, "columns": rel["columns"], "indices": [],
+                "narrative_source": "deterministic", "causation_note": "",
+            })
+            fid += 1
+
+    # duplicate-key findings
+    for d in duplicates:
+        findings.append({
+            "id": f"F{fid}", "severity": "moderate", "kind": "duplicates",
+            "title": f"Duplicate keys: '{d['column']}' repeats {d['count']} time(s)",
+            "description": (f"{d['count']} rows ({d['pct']}%) share a {d['column']} value with another row "
+                            f"({', '.join(d['examples'])}). Any join, lookup or stock-take on this column will double-count."),
+            "evidence": [f"repeated values: {', '.join(d['examples'])}"],
+            "count": d["count"], "pct": d["pct"], "confidence": 97,
+            "possible_factor": None, "columns": [d["column"]], "indices": [],
+            "narrative_source": "deterministic", "causation_note": "",
+        })
+        fid += 1
+
     # order: critical, moderate, info
     rank = {"critical": 0, "moderate": 1, "info": 2}
     findings.sort(key=lambda f: (rank.get(f["severity"], 3), -f.get("confidence", 0)))
@@ -737,6 +1029,9 @@ def analyze(df: pd.DataFrame, dataset_name: str = "uploaded dataset") -> dict:
                      "text": f"{top['pct']}% of your records contain a pattern that differs significantly from the overall population.",
                      "cta": "Investigate"}
 
+    # executive summary: 3 bullets, LLM-polished when a key is configured
+    summary = build_executive_summary(dataset_name, n, findings, data_health, avg_conf, risk)
+
     # chart payloads (generic, frontend picks labels)
     charts = build_charts(df, num_cols, cat_cols, anomalies, contradictions, segments, clusters)
 
@@ -746,6 +1041,8 @@ def analyze(df: pd.DataFrame, dataset_name: str = "uploaded dataset") -> dict:
         "columns": list(df.columns),
         "numeric_columns": num_cols,
         "categorical_columns": cat_cols,
+        "surgery": surgery,
+        "summary": summary,
         "profile": profile,
         "anomalies": {"count": anomalies["anomaly_count"], "pct": anomalies["anomaly_pct"],
                       "method": anomalies["method"], "top": anomalies["top"][:10],
@@ -758,6 +1055,78 @@ def analyze(df: pd.DataFrame, dataset_name: str = "uploaded dataset") -> dict:
         "clusters": clusters["clusters"] if clusters else [],
         "preview": df.head(8).fillna("").to_dict(orient="records"),
     }
+
+
+def build_executive_summary(dataset_name, n, findings, data_health, avg_conf, risk) -> dict:
+    """3-bullet board-level summary. Template fallback; single LLM polish call if keyed."""
+    if not findings:
+        bullets = [f"All clear: {n} records scanned, no significant hidden patterns — this dataset looks genuinely healthy. ✅",
+                   f"Data health {data_health}% · hidden risk {risk}.",
+                   "No action needed. Re-run after your next data refresh."]
+        return {"bullets": bullets, "source": "deterministic"}
+    top = findings[0]
+    second = findings[1] if len(findings) > 1 else None
+    bullets = [
+        f"Top blind spot: {top['title']} — {top['count']} records ({top['pct']}%), confidence {top['confidence']}%."[:220],
+        (f"Also notable: {second['title']} ({second['severity']})."[:200] if second
+         else f"Plus {len(findings) - 1} more finding(s) below."),
+        f"Data health {data_health}% · insight confidence {avg_conf}% · hidden risk {risk}. "
+        f"Start with Investigate on {top['id']}.",
+    ]
+    prompt = (f"Dataset '{dataset_name}' ({n} rows) was audited. Key results: " +
+              " | ".join(bullets) +
+              " Rewrite as exactly 3 crisp executive bullets (≤25 words each), no jargon, no new claims.")
+    llm_text, llm_source = llm_narrative(prompt)
+    if llm_text:
+        lines = [ln.strip(" •-*0123456789.").strip() for ln in llm_text.splitlines() if ln.strip()]
+        lines = [ln for ln in lines if len(ln) > 10][:3]
+        if len(lines) == 3:
+            return {"bullets": lines, "source": llm_source}
+    return {"bullets": bullets, "source": "template"}
+
+
+def build_markdown(rep: dict) -> str:
+    """One-click board-ready report."""
+    L = [f"# BlindSpot Report — {rep.get('dataset', '')}",
+         "",
+         f"Records: **{rep.get('rows')}** · Columns: {len(rep.get('columns', []))} · "
+         f"Critical: **{rep['counts']['critical']}** · Moderate: {rep['counts']['moderate']} · "
+         f"Data issues: {rep['counts']['info']}",
+         "",
+         f"Data health **{rep['scores']['data_health']}%** · "
+         f"Insight confidence **{rep['scores']['insight_confidence']}%** · "
+         f"Hidden risk **{rep['scores']['hidden_risk']}**",
+         "",
+         "## Executive summary",
+         ""]
+    for b in rep.get("summary", {}).get("bullets", []):
+        L.append(f"- {b}")
+    if rep.get("surgery"):
+        L += ["", "## Data preparation (automatic)",
+              ""]
+        for s in rep["surgery"]:
+            L.append(f"- {s}")
+    L += ["", "## Findings", ""]
+    for i, f in enumerate(rep.get("findings", []), 1):
+        L += [f"### {i}. [{f['severity'].upper()}] {f['title']}",
+              "",
+              f"{f['description']}",
+              "",
+              f"Scope: {f['count']} records ({f['pct']}%) · Confidence: {f['confidence']}% · Source: {f.get('narrative_source', '')}",
+              ""]
+        if f.get("possible_factor"):
+            L.append(f"Possible contributing factor: **{f['possible_factor']['variable']}** "
+                     f"({f['possible_factor']['diff_pct']:+}% vs rest).")
+            L.append("")
+        L.append("Evidence:")
+        for e in f.get("evidence", []):
+            L.append(f"- {e}")
+        if f.get("causation_note"):
+            L.append("")
+            L.append(f"*{f['causation_note']}*")
+        L.append("")
+    L.append("_Generated by BlindSpot — your dashboard shows what happened; BlindSpot finds what you missed._")
+    return "\n".join(L)
 
 
 def build_charts(df, num_cols, cat_cols, anomalies, contradictions, segments, clusters) -> dict:
