@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>BlindSpot — AI Data Insight Engine</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script>
+tailwind.config = { theme: { extend: {
+  colors: { ink:'#0b0f1a', panel:'#121829', edge:'#1f2942', neon:'#7c6cff', mint:'#34d399', amber:'#fbbf24', rose:'#fb7185', sky:'#38bdf8' },
+  fontFamily: { disp:['Sora','Inter','system-ui','sans-serif'] }
+}}};
+</script>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700;800&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  body{font-family:Inter,system-ui,sans-serif;background:radial-gradient(1200px 500px at 20% -5%,#1b2350 0%,transparent 60%),radial-gradient(900px 420px at 90% 0%,#3b1d5e 0%,transparent 55%),#0b0f1a;}
+  .card{background:linear-gradient(180deg,rgba(255,255,255,.045),rgba(255,255,255,.015));border:1px solid #1f2942;border-radius:18px;}
+  .chip{border:1px solid #2a3554;border-radius:999px;}
+  .bar{height:10px;border-radius:999px;background:#1b2440;overflow:hidden}
+  .bar>i{display:block;height:100%;border-radius:999px}
+  .sev-critical{border-left:4px solid #fb7185}.sev-moderate{border-left:4px solid #fbbf24}.sev-info{border-left:4px solid #38bdf8}
+  .btn-neon{background:linear-gradient(135deg,#7c6cff,#38bdf8);color:#0b0f1a;font-weight:700}
+  .btn-neon:hover{filter:brightness(1.08)}
+  .ghost{border:1px solid #2a3554}.ghost:hover{border-color:#7c6cff}
+  .step-dot{width:26px;height:26px;border-radius:999px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;background:#1b2440;color:#8ea0c9;border:1px solid #2a3554}
+  .step-on{background:linear-gradient(135deg,#7c6cff,#38bdf8);color:#0b0f1a;border-color:transparent}
+  .step-done{background:#34d399;color:#06281c;border-color:transparent}
+  #drop.drag{border-color:#7c6cff!important;background:rgba(124,108,255,.08)}
+  pre.ev{white-space:pre-wrap}
+  .modal-bg{background:rgba(4,7,15,.72);backdrop-filter:blur(6px)}
+  ::-webkit-scrollbar{width:10px;height:10px}::-webkit-scrollbar-thumb{background:#26314f;border-radius:8px}
+</style>
+</head>
+<body class="text-slate-200 min-h-screen">
+<div class="max-w-7xl mx-auto px-4 sm:px-6 pb-20">
+
+  <!-- HEADER -->
+  <header class="flex flex-wrap items-center gap-4 py-6">
+    <div class="flex items-center gap-3">
+      <div class="w-11 h-11 rounded-2xl flex items-center justify-center font-extrabold text-xl text-ink" style="background:linear-gradient(135deg,#7c6cff,#38bdf8)">◉</div>
+      <div>
+        <div class="font-disp font-extrabold text-2xl tracking-tight text-white">BLINDSPOT</div>
+        <div class="text-xs text-slate-400 -mt-0.5">Your dashboard shows what happened. BlindSpot finds what you missed.</div>
+      </div>
+    </div>
+    <div class="ml-auto flex items-center gap-2 text-xs">
+      <span class="chip px-3 py-1 text-slate-300">stats + IsolationForest + k-means</span>
+      <span id="llmBadge" class="chip px-3 py-1 text-slate-400">template reasoning</span>
+      <a href="/api/health" target="_blank" class="chip px-3 py-1 text-mint">● engine online</a>
+    </div>
+  </header>
+
+  <!-- HERO / UPLOAD -->
+  <section id="hero" class="card p-6 sm:p-8">
+    <div class="grid lg:grid-cols-5 gap-6">
+      <div class="lg:col-span-3">
+        <h1 class="font-disp text-3xl sm:text-4xl font-extrabold text-white leading-tight">Upload a file that looks <span class="text-mint">normal</span>.<br/>We’ll find what <span style="color:#7c6cff">doesn’t make sense</span>.</h1>
+        <p class="mt-3 text-sm text-slate-400">Anomalies · contradictions · missing data · hidden segment effects · entry errors — each with evidence, confidence, and a one-click investigation.</p>
+        <div id="drop" class="mt-5 border-2 border-dashed border-edge rounded-2xl p-6 text-center cursor-pointer">
+          <div class="text-4xl">📥</div>
+          <div class="mt-2 font-semibold text-white">Drop your data file here — CSV, Excel, JSON, TSV or Parquet</div>
+          <div class="text-xs text-slate-500 mt-1">or click to browse · analysis runs locally in seconds</div>
+          <input id="file" type="file" accept=".csv,.tsv,.txt,.xlsx,.xls,.json,.parquet" class="hidden" />
+        </div>
+        <div class="mt-3 flex flex-wrap gap-2 text-sm">
+          <button data-sample="students" class="sampleBtn btn-neon px-4 py-2 rounded-xl">▶ Try students.csv</button>
+          <button data-sample="sales" class="sampleBtn ghost px-4 py-2 rounded-xl">▶ Try sales.csv</button>
+          <span class="text-xs text-slate-500 self-center ml-1">Tip: set <code>OPENAI_API_KEY</code> to upgrade narratives to LLM reasoning.</span>
+        </div>
+        <!-- pipeline -->
+        <div id="pipe" class="hidden mt-5">
+          <div class="flex items-center gap-2 text-xs text-slate-400" id="pipeSteps"></div>
+          <div class="bar mt-3"><i id="pipeBar" style="width:5%;background:linear-gradient(90deg,#7c6cff,#38bdf8)"></i></div>
+          <div id="pipeMsg" class="text-xs text-slate-400 mt-2">profiling data…</div>
+        </div>
+      </div>
+      <div class="lg:col-span-2">
+        <div class="card p-5 !rounded-2xl">
+          <div class="text-xs uppercase tracking-widest text-slate-500">How it works</div>
+          <ol class="mt-3 space-y-3 text-sm">
+            <li><b class="text-white">1 · Profile</b> <span class="text-slate-400">— mean, spread, correlations, missingness</span></li>
+            <li><b class="text-white">2 · Detect</b> <span class="text-slate-400">— IsolationForest + z-score outliers</span></li>
+            <li><b class="text-white">3 · Discover</b> <span class="text-slate-400">— contradiction groups, segment gaps, clusters</span></li>
+            <li><b class="text-white">4 · Reason</b> <span class="text-slate-400">— evidence-backed narrative (LLM if key set)</span></li>
+            <li><b class="text-white">5 · Investigate</b> <span class="text-slate-400">— one click drills into every variable</span></li>
+          </ol>
+          <div class="mt-4 rounded-xl p-4 text-sm" style="background:rgba(124,108,255,.08);border:1px solid #2c3570">
+            <b class="text-white">🧠 You didn’t ask — but we found this:</b>
+            <div class="text-slate-300 mt-1">e.g. “24 students with &gt;90% attendance &amp; &gt;80% internals score &lt;55% in finals.” Averages hide them. BlindSpot doesn’t.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- DASHBOARD -->
+  <section id="dash" class="hidden mt-6 space-y-6">
+    <div class="card p-6">
+      <div class="flex flex-wrap items-end gap-4">
+        <div>
+          <div class="text-xs uppercase tracking-widest text-slate-500">BlindSpot report</div>
+          <div id="dsName" class="font-disp text-xl font-bold text-white"></div>
+        </div>
+        <div class="ml-auto grid grid-cols-2 sm:grid-cols-4 gap-3 text-center">
+          <div class="card px-5 py-3"><div id="kRows" class="text-2xl font-extrabold text-white">–</div><div class="text-[11px] text-slate-500">RECORDS</div></div>
+          <div class="card px-5 py-3"><div id="kAnom" class="text-2xl font-extrabold text-rose">–</div><div class="text-[11px] text-slate-500">ANOMALIES</div></div>
+          <div class="card px-5 py-3"><div id="kCrit" class="text-2xl font-extrabold text-rose">–</div><div class="text-[11px] text-slate-500">🔴 CRITICAL</div></div>
+          <div class="card px-5 py-3"><div id="kMod" class="text-2xl font-extrabold text-amber">–</div><div class="text-[11px] text-slate-500">🟡 MODERATE <span id="kInfo" class="text-sky"></span></div></div>
+        </div>
+      </div>
+      <div class="grid sm:grid-cols-3 gap-4 mt-5">
+        <div><div class="flex justify-between text-xs"><span class="text-slate-400">DATA HEALTH</span><b id="vHealth" class="text-white"></b></div><div class="bar mt-1"><i id="bHealth" style="background:#34d399"></i></div></div>
+        <div><div class="flex justify-between text-xs"><span class="text-slate-400">INSIGHT CONFIDENCE</span><b id="vConf" class="text-white"></b></div><div class="bar mt-1"><i id="bConf" style="background:linear-gradient(90deg,#7c6cff,#38bdf8)"></i></div></div>
+        <div><div class="flex justify-between text-xs"><span class="text-slate-400">HIDDEN RISK</span><b id="vRisk" class="text-white"></b></div><div class="bar mt-1"><i id="bRisk" style="background:#fb7185"></i></div></div>
+      </div>
+      <div id="spot" class="hidden mt-5 rounded-2xl p-5" style="background:linear-gradient(135deg,rgba(124,108,255,.18),rgba(56,189,248,.10));border:1px solid #3b4383">
+        <div class="font-disp font-bold text-white">🧠 YOU DIDN’T ASK — BUT WE FOUND THIS</div>
+        <div id="spotText" class="text-sm text-slate-200 mt-1"></div>
+        <button id="spotBtn" class="btn-neon px-4 py-1.5 rounded-xl text-sm mt-3">Investigate →</button>
+      </div>
+    </div>
+
+    <div class="grid lg:grid-cols-3 gap-6">
+      <div class="lg:col-span-2 space-y-4">
+        <h2 class="font-disp font-bold text-white text-lg">🔎 AI-discovered findings <span id="fCount" class="text-slate-500 text-sm"></span></h2>
+        <div id="findings" class="space-y-4"></div>
+      </div>
+      <div class="space-y-4">
+        <div class="card p-5"><div class="text-xs uppercase tracking-widest text-slate-500">Anomaly map</div><div id="scatterMeta" class="text-xs text-slate-400 mt-1"></div><canvas id="chScatter" height="230"></canvas></div>
+        <div class="card p-5"><div class="text-xs uppercase tracking-widest text-slate-500">Segment gap</div><div id="segMeta" class="text-xs text-slate-400 mt-1"></div><canvas id="chSeg" height="200"></canvas></div>
+        <div class="card p-5"><div class="text-xs uppercase tracking-widest text-slate-500">Distribution</div><div id="histMeta" class="text-xs text-slate-400 mt-1"></div><canvas id="chHist" height="170"></canvas></div>
+      </div>
+    </div>
+
+    <div class="card p-5">
+      <div class="text-xs uppercase tracking-widest text-slate-500 mb-2">Data preview (first 8 rows)</div>
+      <div class="overflow-auto"><table id="prev" class="text-xs w-full"></table></div>
+    </div>
+  </section>
+</div>
+
+<!-- INVESTIGATE MODAL -->
+<div id="modal" class="hidden fixed inset-0 modal-bg z-50 flex items-center justify-center p-4">
+  <div class="card max-w-2xl w-full p-6 max-h-[85vh] overflow-auto" style="background:#101728">
+    <div class="flex items-start gap-3">
+      <div class="text-2xl">🔍</div>
+      <div><div class="text-xs text-slate-500 uppercase tracking-widest">Investigation</div><div id="mTitle" class="font-disp font-bold text-white"></div></div>
+      <button id="mClose" class="ml-auto ghost rounded-xl px-3 py-1">✕</button>
+    </div>
+    <div id="mSummary" class="mt-3 text-sm rounded-xl p-3" style="background:rgba(52,211,153,.08);border:1px solid #1e4d3f"></div>
+    <table class="w-full text-xs mt-3"><thead><tr class="text-slate-500 text-left"><th class="py-1">Variable</th><th>Group</th><th>Rest</th><th>Δ</th><th>Verdict</th></tr></thead><tbody id="mRows"></tbody></table>
+    <div class="text-[11px] text-slate-500 mt-3">⚠️ Correlation is not causation. Verify with domain knowledge before acting.</div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

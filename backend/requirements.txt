@@ -1,0 +1,9 @@
+fastapi==0.129.0
+uvicorn==0.40.0
+pandas==2.3.3
+numpy==2.3.5
+scikit-learn
+scipy
+python-multipart
+openpyxl
+xlrd  # legacy .xls workbooks
