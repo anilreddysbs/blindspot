@@ -9,8 +9,31 @@ Designed to be domain-agnostic: works on students, sales, or any tabular CSV.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import numpy as np
 import pandas as pd
+
+
+def _load_dotenv():
+    """Minimal .env loader (no dependency): reads backend/.env into os.environ
+    without overriding real environment variables."""
+    env_path = Path(__file__).resolve().parent / ".env"
+    if not env_path.exists():
+        return
+    try:
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key, val = key.strip(), val.strip().strip("'\"")
+            if key and key not in os.environ:
+                os.environ[key] = val
+    except Exception:
+        pass
+
+
+_load_dotenv()
 
 try:
     from sklearn.ensemble import IsolationForest
@@ -339,22 +362,56 @@ def detect_clusters(df: pd.DataFrame, num_cols: list[str]):
 
 # ---------------------------------------------------------------- Layer 4: narrative reasoning
 
-LLM_TEMPLATE_NOTE = "Template reasoning (no LLM key configured). Set OPENAI_API_KEY for LLM-generated narratives."
+LLM_TEMPLATE_NOTE = ("Template reasoning (no LLM key configured). "
+                      "Set GEMINI_API_KEY (or OPENAI_API_KEY) for LLM-generated narratives.")
 
-def llm_narrative(prompt: str) -> tuple[str | None, str]:
-    """Try an OpenAI-compatible chat API if a key exists. Returns (text, source)."""
+SYSTEM_PROMPT = ("You are BlindSpot, a careful data analyst. You reason only from the supplied "
+                 "evidence. You always distinguish correlation from causation and give a "
+                 "confidence level with justification.")
+
+
+def _gemini_narrative(prompt: str) -> tuple[str | None, str]:
+    """Native Gemini API call (no dependency). Returns (text, source) or (None, reason)."""
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        return None, "no Gemini key"
+    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    try:
+        import json as _json
+        import urllib.request
+        import urllib.parse
+        url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+               f"{urllib.parse.quote(model)}:generateContent")
+        body = _json.dumps({
+            "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.3, "maxOutputTokens": 450},
+        }).encode()
+        req = urllib.request.Request(url, data=body,
+                                     headers={"Content-Type": "application/json",
+                                              "x-goog-api-key": api_key})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = _json.loads(resp.read().decode())
+        text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        return text, f"LLM ({model})"
+    except Exception as e:
+        return None, f"Gemini call failed ({e})"
+
+
+def _openai_narrative(prompt: str) -> tuple[str | None, str]:
+    """OpenAI-compatible chat API fallback. Returns (text, source) or (None, reason)."""
     api_key = os.getenv("OPENAI_API_KEY") or os.getenv("LLM_API_KEY")
+    if not api_key:
+        return None, "no OpenAI key"
     base = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
     model = os.getenv("LLM_MODEL", "gpt-4o-mini")
-    if not api_key:
-        return None, LLM_TEMPLATE_NOTE
     try:
         import json as _json
         import urllib.request
         body = _json.dumps({
             "model": model,
             "messages": [
-                {"role": "system", "content": "You are BlindSpot, a careful data analyst. You reason only from the supplied evidence. You always distinguish correlation from causation and give a confidence level with justification."},
+                {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.3,
@@ -369,7 +426,22 @@ def llm_narrative(prompt: str) -> tuple[str | None, str]:
         text = data["choices"][0]["message"]["content"].strip()
         return text, f"LLM ({model})"
     except Exception as e:
-        return None, f"LLM call failed ({e}); used template reasoning."
+        return None, f"OpenAI call failed ({e})"
+
+
+def llm_narrative(prompt: str) -> tuple[str | None, str]:
+    """Layer 4 reasoning: Gemini first, then OpenAI-compatible, else template.
+    Returns (text, source)."""
+    text, source = _gemini_narrative(prompt)
+    if text:
+        return text, source
+    gemini_err = source
+    text, source = _openai_narrative(prompt)
+    if text:
+        return text, source
+    if gemini_err != "no Gemini key" or source != "no OpenAI key":
+        return None, f"{gemini_err}; {source}; used template reasoning."
+    return None, LLM_TEMPLATE_NOTE
 
 
 def template_contradiction_text(f: dict, df: pd.DataFrame) -> tuple[str, str, list[str]]:

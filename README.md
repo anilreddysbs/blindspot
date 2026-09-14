@@ -37,10 +37,12 @@ CSV → Layer 1 stats → Layer 2 IsolationForest → Layer 3 patterns → Layer
                                                                        correlation ≠ causation)
 ```
 
-- **No LLM key required.** Set `OPENAI_API_KEY` (optionally `OPENAI_BASE_URL` /
-  `LLM_MODEL`) to upgrade finding narratives to LLM reasoning over the
-  discovered evidence. Without a key, built-in template reasoning is used and
-  the badge in the header says so honestly.
+- **No LLM key required.** Copy `backend/.env.example` to `backend/.env` and add
+  your `GEMINI_API_KEY` (get one free at Google AI Studio) to upgrade finding
+  narratives to Gemini reasoning over the discovered evidence
+  (`GEMINI_MODEL` overrides the default `gemini-2.5-flash`). An `OPENAI_API_KEY`
+  (or any `OPENAI_BASE_URL`-compatible endpoint) works as fallback. Without a key,
+  built-in template reasoning is used and the badge in the header says so honestly.
 - **Domain-agnostic.** Education, retail, manufacturing, finance — any tabular CSV.
   Direction-aware segment analysis (high returns/delays = bad, high sales = good).
 
@@ -51,6 +53,8 @@ blindspot/
 ├── backend/
 │   ├── main.py          # FastAPI: /api/analyze, /api/analyze-sample, /api/investigate
 │   ├── analyzer.py      # the 4-layer insight engine (stats + ML + patterns + reasoning)
+│   ├── .env             # your keys (git-ignored; copy from .env.example)
+│   ├── .env.example     # config template (safe to commit)
 │   └── requirements.txt
 ├── frontend/
 │   ├── index.html       # dashboard (Tailwind + Chart.js via CDN)
